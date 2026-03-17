@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vmalert-resource-fixer
+  namespace: monitoring
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: vmalert-resource-fixer
+          restartPolicy: Never
+          containers:
+            - name: fixer
+              image: ghcr.io/your-org/vmalert-resource-fixer:latest
+              imagePullPolicy: IfNotPresent
+              args:
+                - --apply
+                - --namespace
+                - monitoring
+                - --cpu-headroom
+                - "1.25"
+                - --memory-headroom
+                - "1.25"
