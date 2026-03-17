@@ -15,6 +15,10 @@ internal static class KubernetesClientFactory
                 kubeconfigPath: options.KubeConfigPath,
                 currentContext: options.Context);
         }
+        else if (KubernetesClientConfiguration.IsInCluster())
+        {
+            config = KubernetesClientConfiguration.InClusterConfig();
+        }
         else
         {
             config = KubernetesClientConfiguration.BuildDefaultConfig();
