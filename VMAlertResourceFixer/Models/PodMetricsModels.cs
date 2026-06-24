@@ -4,6 +4,8 @@ namespace VMAlertResourceFixer.Models;
 
 internal sealed class PodMetricsListModel
 {
+    public KubernetesListMetadataModel Metadata { get; set; } = new();
+
     public List<PodMetricsModel> Items { get; set; } = [];
 }
 

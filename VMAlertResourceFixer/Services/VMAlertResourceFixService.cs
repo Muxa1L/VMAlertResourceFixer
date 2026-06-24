@@ -17,6 +17,7 @@ internal sealed class VMAlertResourceFixService
     private const string MetricsGroup = "metrics.k8s.io";
     private const string MetricsVersion = "v1beta1";
     private const string PodsPlural = "pods";
+    private const int ListPageSize = 250;
 
     private readonly IKubernetes _kubernetes;
     private readonly AppOptions _options;
@@ -34,16 +35,26 @@ internal sealed class VMAlertResourceFixService
             : "Running in dry-run mode. No VMAlert objects will be modified.");
 
         var vmAlerts = await GetVmAlertsAsync(cancellationToken);
+        if (_options.Verbose)
+        {
+            Console.WriteLine($"Discovered {vmAlerts.Count} VMAlert resources before applying name filters.");
+        }
+
         if (_options.Names.Count > 0)
         {
             vmAlerts = vmAlerts
                 .Where(item => _options.Names.Contains(item.Metadata.Name))
                 .ToList();
+
+            if (_options.Verbose)
+            {
+                Console.WriteLine($"Retained {vmAlerts.Count} VMAlert resources after applying name filters.");
+            }
         }
 
         if (vmAlerts.Count == 0)
         {
-            Console.WriteLine("No VMAlert resources matched the supplied filters.");
+            Console.WriteLine($"No VMAlert resources matched the supplied filters. {DescribeFilters()}");
             return 0;
         }
 
@@ -121,26 +132,13 @@ internal sealed class VMAlertResourceFixService
 
         if (_options.Namespaces.Count == 0)
         {
-            var raw = await _kubernetes.CustomObjects.ListClusterCustomObjectAsync(
-                VmOperatorGroup,
-                VmOperatorVersion,
-                VmAlertPlural,
-                cancellationToken: cancellationToken);
-
-            items.AddRange(ToVmAlertList(raw).Items);
+            items.AddRange(await ListAllVmAlertsAsync(cancellationToken));
             return items;
         }
 
         foreach (var ns in _options.Namespaces.OrderBy(value => value))
         {
-            var raw = await _kubernetes.CustomObjects.ListNamespacedCustomObjectAsync(
-                VmOperatorGroup,
-                VmOperatorVersion,
-                ns,
-                VmAlertPlural,
-                cancellationToken: cancellationToken);
-
-            items.AddRange(ToVmAlertList(raw).Items);
+            items.AddRange(await ListVmAlertsInNamespaceAsync(ns, cancellationToken));
         }
 
         return items;
@@ -148,17 +146,87 @@ internal sealed class VMAlertResourceFixService
 
     private async Task<Dictionary<string, PodMetricsModel>> GetPodMetricsByNameAsync(string ns, CancellationToken cancellationToken)
     {
-        var raw = await _kubernetes.CustomObjects.ListNamespacedCustomObjectAsync(
-            MetricsGroup,
-            MetricsVersion,
-            ns,
-            PodsPlural,
-            cancellationToken: cancellationToken);
+        var items = new List<PodMetricsModel>();
+        string? continueParameter = null;
 
-        var metrics = ToPodMetricsList(raw);
-        return metrics.Items
+        do
+        {
+            var page = await _kubernetes.CustomObjects.ListNamespacedCustomObjectAsync<PodMetricsListModel>(
+                MetricsGroup,
+                MetricsVersion,
+                ns,
+                PodsPlural,
+                continueParameter: continueParameter,
+                limit: ListPageSize,
+                cancellationToken: cancellationToken);
+
+            if (page?.Items is { Count: > 0 })
+            {
+                items.AddRange(page.Items.Where(item => !string.IsNullOrWhiteSpace(item.Metadata?.Name)));
+            }
+
+            continueParameter = page?.Metadata?.ContinueToken;
+        }
+        while (!string.IsNullOrWhiteSpace(continueParameter));
+
+        return items
             .Where(item => !string.IsNullOrWhiteSpace(item.Metadata.Name))
             .ToDictionary(item => item.Metadata.Name!, item => item, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private async Task<List<VmAlertModel>> ListAllVmAlertsAsync(CancellationToken cancellationToken)
+    {
+        var items = new List<VmAlertModel>();
+        string? continueParameter = null;
+
+        do
+        {
+            var page = await _kubernetes.CustomObjects.ListCustomObjectForAllNamespacesAsync<VmAlertListModel>(
+                VmOperatorGroup,
+                VmOperatorVersion,
+                VmAlertPlural,
+                continueParameter: continueParameter,
+                limit: ListPageSize,
+                cancellationToken: cancellationToken);
+
+            if (page?.Items is { Count: > 0 })
+            {
+                items.AddRange(page.Items.Where(HasVmAlertIdentity));
+            }
+
+            continueParameter = page?.Metadata?.ContinueToken;
+        }
+        while (!string.IsNullOrWhiteSpace(continueParameter));
+
+        return items;
+    }
+
+    private async Task<List<VmAlertModel>> ListVmAlertsInNamespaceAsync(string ns, CancellationToken cancellationToken)
+    {
+        var items = new List<VmAlertModel>();
+        string? continueParameter = null;
+
+        do
+        {
+            var page = await _kubernetes.CustomObjects.ListNamespacedCustomObjectAsync<VmAlertListModel>(
+                VmOperatorGroup,
+                VmOperatorVersion,
+                ns,
+                VmAlertPlural,
+                continueParameter: continueParameter,
+                limit: ListPageSize,
+                cancellationToken: cancellationToken);
+
+            if (page?.Items is { Count: > 0 })
+            {
+                items.AddRange(page.Items.Where(HasVmAlertIdentity));
+            }
+
+            continueParameter = page?.Metadata?.ContinueToken;
+        }
+        while (!string.IsNullOrWhiteSpace(continueParameter));
+
+        return items;
     }
 
     private async Task<IReadOnlyList<V1Pod>> GetDeploymentPodsAsync(string ns, V1Deployment deployment, CancellationToken cancellationToken)
@@ -270,14 +338,22 @@ internal sealed class VMAlertResourceFixService
             cancellationToken: cancellationToken);
     }
 
-    private static VmAlertListModel ToVmAlertList(object raw)
+    private string DescribeFilters()
     {
-        return JObject.FromObject(raw).ToObject<VmAlertListModel>() ?? new VmAlertListModel();
+        var namespaceFilter = _options.Namespaces.Count == 0
+            ? "all namespaces"
+            : $"namespaces={string.Join(",", _options.Namespaces.OrderBy(value => value))}";
+        var nameFilter = _options.Names.Count == 0
+            ? "all names"
+            : $"names={string.Join(",", _options.Names.OrderBy(value => value))}";
+
+        return $"Scope: {namespaceFilter}; {nameFilter}.";
     }
 
-    private static PodMetricsListModel ToPodMetricsList(object raw)
+    private static bool HasVmAlertIdentity(VmAlertModel item)
     {
-        return JObject.FromObject(raw).ToObject<PodMetricsListModel>() ?? new PodMetricsListModel();
+        return !string.IsNullOrWhiteSpace(item.Metadata.Name)
+            && !string.IsNullOrWhiteSpace(item.Metadata.NamespaceProperty);
     }
 
     private static bool IsRunningPod(V1Pod pod)
