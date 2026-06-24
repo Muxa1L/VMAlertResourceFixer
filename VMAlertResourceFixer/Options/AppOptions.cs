@@ -34,6 +34,8 @@ internal sealed record AppOptions
 
     public TimeSpan SampleInterval { get; private init; } = TimeSpan.FromSeconds(30);
 
+    public int Parallelism { get; private init; } = 8;
+
     public static AppOptions Parse(string[] args)
     {
         var options = new AppOptions();
@@ -109,6 +111,10 @@ internal sealed record AppOptions
                     options = options with { SampleInterval = ReadPositiveDuration(args, ref index, arg) };
                     break;
 
+                case "--parallelism":
+                    options = options with { Parallelism = ReadPositiveInt(args, ref index, arg) };
+                    break;
+
                 default:
                     throw new ArgumentException($"Unknown argument '{arg}'.");
             }
@@ -145,6 +151,7 @@ internal sealed record AppOptions
         Console.WriteLine("  --memory-step-mi <value> Memory rounding step in MiB. Default: 16");
         Console.WriteLine("  --sample-period <value>  Metrics sampling window. Default: 2m");
         Console.WriteLine("  --sample-interval <v>    Metrics sampling interval. Default: 30s");
+        Console.WriteLine("  --parallelism <value>    Max concurrent Kubernetes lookups. Default: 8");
         Console.WriteLine("  --verbose                Print extra diagnostic output.");
         Console.WriteLine("  -h, --help               Show this help.");
         Console.WriteLine();

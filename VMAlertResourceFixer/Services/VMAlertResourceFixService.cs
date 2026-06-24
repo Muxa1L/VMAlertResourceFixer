@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using System.Collections.Concurrent;
 using k8s;
 using k8s.Models;
 using Newtonsoft.Json.Linq;
@@ -10,6 +11,7 @@ using VMAlertResourceFixer.Utilities;
 namespace VMAlertResourceFixer.Services;
 
 internal sealed record PodUsageAggregate(int PeakCpuMillicores, long PeakMemoryBytes, int ObservationCount);
+internal sealed record VmAlertProcessingResult(IReadOnlyList<string> LogLines, bool Changed, bool Skipped);
 
 internal sealed class VMAlertResourceFixService
 {
@@ -68,64 +70,33 @@ internal sealed class VMAlertResourceFixService
             .ToList();
 
         Console.WriteLine(
-            $"Collecting pod metrics samples for {FormatDuration(_options.SamplePeriod)} every {FormatDuration(_options.SampleInterval)} across {namespaces.Count} namespace(s).");
+            $"Collecting pod metrics samples for {FormatDuration(_options.SamplePeriod)} every {FormatDuration(_options.SampleInterval)} across {namespaces.Count} namespace(s) with parallelism {_options.Parallelism}.");
 
         var metricsCache = await CollectMaxPodMetricsByNamespaceAsync(namespaces, cancellationToken);
+        var orderedAlerts = vmAlerts.OrderBy(item => item.Metadata.NamespaceProperty).ThenBy(item => item.Metadata.Name).ToList();
+        var results = await RunBoundedAsync(
+            orderedAlerts,
+            _options.Parallelism,
+            async (vmAlert, token) => await ProcessVmAlertAsync(vmAlert, metricsCache, token),
+            cancellationToken);
+
         var changed = 0;
         var skipped = 0;
 
-        foreach (var vmAlert in vmAlerts.OrderBy(item => item.Metadata.NamespaceProperty).ThenBy(item => item.Metadata.Name))
+        foreach (var result in results)
         {
-            var ns = vmAlert.Metadata.NamespaceProperty;
-            var name = vmAlert.Metadata.Name;
-
-            try
+            foreach (var line in result.LogLines)
             {
-                var deploymentName = $"vmalert-{name}";
-                var deployment = await _kubernetes.AppsV1.ReadNamespacedDeploymentAsync(deploymentName, ns, cancellationToken: cancellationToken);
+                Console.WriteLine(line);
+            }
 
-                metricsCache.TryGetValue(ns, out var namespaceMetrics);
-                namespaceMetrics ??= new Dictionary<string, PodUsageAggregate>(StringComparer.OrdinalIgnoreCase);
-
-                var pods = await GetDeploymentPodsAsync(ns, deployment, cancellationToken);
-                var recommendation = BuildRecommendation(pods, namespaceMetrics);
-                if (recommendation is null)
-                {
-                    Console.WriteLine($"SKIP  {ns}/{name}  No running pod metrics were found.");
-                    skipped++;
-                    continue;
-                }
-
-                var currentCpu = GetCurrentRequest(vmAlert.Spec.Resources?.Requests, "cpu");
-                var currentMemory = GetCurrentRequest(vmAlert.Spec.Resources?.Requests, "memory");
-                var requiresUpdate = !string.Equals(currentCpu, recommendation.CpuRequest, StringComparison.OrdinalIgnoreCase)
-                    || !string.Equals(currentMemory, recommendation.MemoryRequest, StringComparison.OrdinalIgnoreCase);
-
-                Console.WriteLine(
-                    $"{(_options.Apply && requiresUpdate ? "PATCH" : "INFO ")}  {ns}/{name}  " +
-                    $"peakCpu={recommendation.PeakCpuMillicores}m peakMemory={FormatBytesAsMi(recommendation.PeakMemoryBytes)} " +
-                    $"recommendedCpu={recommendation.CpuRequest} recommendedMemory={recommendation.MemoryRequest} samples={recommendation.SampleCount}");
-
-                if (_options.Verbose)
-                {
-                    Console.WriteLine($"      currentCpu={currentCpu ?? "<unset>"} currentMemory={currentMemory ?? "<unset>"}");
-                }
-
-                if (!requiresUpdate)
-                {
-                    continue;
-                }
-
-                if (_options.Apply)
-                {
-                    await PatchVmAlertRequestsAsync(ns, name, recommendation, cancellationToken);
-                }
-
+            if (result.Changed)
+            {
                 changed++;
             }
-            catch (k8s.Autorest.HttpOperationException ex) when (ex.Response is { StatusCode: HttpStatusCode.NotFound })
+
+            if (result.Skipped)
             {
-                Console.WriteLine($"SKIP  {ns}/{name}  Deployment vmalert-{name} was not found.");
                 skipped++;
             }
         }
@@ -167,10 +138,15 @@ internal sealed class VMAlertResourceFixService
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            foreach (var ns in namespaces)
+            var snapshots = await RunBoundedAsync(
+                namespaces,
+                _options.Parallelism,
+                async (ns, token) => (Namespace: ns, Snapshot: await GetPodMetricsByNameAsync(ns, token)),
+                cancellationToken);
+
+            foreach (var snapshot in snapshots)
             {
-                var snapshot = await GetPodMetricsByNameAsync(ns, cancellationToken);
-                MergePodMetricSnapshot(collected[ns], snapshot);
+                MergePodMetricSnapshot(collected[snapshot.Namespace], snapshot.Snapshot);
             }
 
             if (sampleIndex == snapshotCount - 1)
@@ -192,6 +168,65 @@ internal sealed class VMAlertResourceFixService
         }
 
         return collected;
+    }
+
+    private async Task<VmAlertProcessingResult> ProcessVmAlertAsync(
+        VmAlertModel vmAlert,
+        IReadOnlyDictionary<string, Dictionary<string, PodUsageAggregate>> metricsCache,
+        CancellationToken cancellationToken)
+    {
+        var ns = vmAlert.Metadata.NamespaceProperty;
+        var name = vmAlert.Metadata.Name;
+        var logLines = new List<string>();
+
+        try
+        {
+            var deploymentName = $"vmalert-{name}";
+            var deployment = await _kubernetes.AppsV1.ReadNamespacedDeploymentAsync(deploymentName, ns, cancellationToken: cancellationToken);
+
+            metricsCache.TryGetValue(ns, out var namespaceMetrics);
+            namespaceMetrics ??= new Dictionary<string, PodUsageAggregate>(StringComparer.OrdinalIgnoreCase);
+
+            var pods = await GetDeploymentPodsAsync(ns, deployment, cancellationToken);
+            var recommendation = BuildRecommendation(pods, namespaceMetrics);
+            if (recommendation is null)
+            {
+                logLines.Add($"SKIP  {ns}/{name}  No running pod metrics were found.");
+                return new VmAlertProcessingResult(logLines, Changed: false, Skipped: true);
+            }
+
+            var currentCpu = GetCurrentRequest(vmAlert.Spec.Resources?.Requests, "cpu");
+            var currentMemory = GetCurrentRequest(vmAlert.Spec.Resources?.Requests, "memory");
+            var requiresUpdate = !string.Equals(currentCpu, recommendation.CpuRequest, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(currentMemory, recommendation.MemoryRequest, StringComparison.OrdinalIgnoreCase);
+
+            logLines.Add(
+                $"{(_options.Apply && requiresUpdate ? "PATCH" : "INFO ")}  {ns}/{name}  " +
+                $"peakCpu={recommendation.PeakCpuMillicores}m peakMemory={FormatBytesAsMi(recommendation.PeakMemoryBytes)} " +
+                $"recommendedCpu={recommendation.CpuRequest} recommendedMemory={recommendation.MemoryRequest} samples={recommendation.SampleCount}");
+
+            if (_options.Verbose)
+            {
+                logLines.Add($"      currentCpu={currentCpu ?? "<unset>"} currentMemory={currentMemory ?? "<unset>"}");
+            }
+
+            if (!requiresUpdate)
+            {
+                return new VmAlertProcessingResult(logLines, Changed: false, Skipped: false);
+            }
+
+            if (_options.Apply)
+            {
+                await PatchVmAlertRequestsAsync(ns, name, recommendation, cancellationToken);
+            }
+
+            return new VmAlertProcessingResult(logLines, Changed: true, Skipped: false);
+        }
+        catch (k8s.Autorest.HttpOperationException ex) when (ex.Response is { StatusCode: HttpStatusCode.NotFound })
+        {
+            logLines.Add($"SKIP  {ns}/{name}  Deployment vmalert-{name} was not found.");
+            return new VmAlertProcessingResult(logLines, Changed: false, Skipped: true);
+        }
     }
 
     private async Task<Dictionary<string, PodMetricsModel>> GetPodMetricsByNameAsync(string ns, CancellationToken cancellationToken)
@@ -480,6 +515,44 @@ internal sealed class VMAlertResourceFixService
         }
 
         return Math.Max(1, (int)Math.Floor(period.Ticks / (double)interval.Ticks) + 1);
+    }
+
+    private static async Task<IReadOnlyList<TResult>> RunBoundedAsync<TSource, TResult>(
+        IReadOnlyCollection<TSource> items,
+        int parallelism,
+        Func<TSource, CancellationToken, Task<TResult>> operation,
+        CancellationToken cancellationToken)
+    {
+        if (items.Count == 0)
+        {
+            return [];
+        }
+
+        var results = new TResult[items.Count];
+        using var semaphore = new SemaphoreSlim(Math.Max(1, parallelism));
+        var tasks = items.Select((item, index) => RunBoundedItemAsync(item, index, results, semaphore, operation, cancellationToken)).ToArray();
+
+        await Task.WhenAll(tasks);
+        return results;
+    }
+
+    private static async Task RunBoundedItemAsync<TSource, TResult>(
+        TSource item,
+        int index,
+        TResult[] results,
+        SemaphoreSlim semaphore,
+        Func<TSource, CancellationToken, Task<TResult>> operation,
+        CancellationToken cancellationToken)
+    {
+        await semaphore.WaitAsync(cancellationToken);
+        try
+        {
+            results[index] = await operation(item, cancellationToken);
+        }
+        finally
+        {
+            semaphore.Release();
+        }
     }
 
     private static string BuildLabelSelector(V1LabelSelector? selector)

@@ -27,6 +27,7 @@ By default the tool runs in dry-run mode.
 - Memory rounding step: `16Mi`
 - Sampling period: `2m`
 - Sampling interval: `30s`
+- Parallelism: `8`
 
 ## Usage
 
@@ -58,6 +59,12 @@ Collect multiple samples over five minutes and use the max observed values:
 
 ```powershell
 dotnet run --project .\VMAlertResourceFixer\VMAlertResourceFixer.csproj -- --sample-period 5m --sample-interval 30s
+```
+
+Increase concurrent Kubernetes lookups for large clusters:
+
+```powershell
+dotnet run --project .\VMAlertResourceFixer\VMAlertResourceFixer.csproj -- --parallelism 16 --sample-period 5m --sample-interval 30s
 ```
 
 ## Required cluster permissions
