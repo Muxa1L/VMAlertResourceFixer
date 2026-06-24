@@ -12,6 +12,13 @@ namespace VMAlertResourceFixer.Services;
 
 internal sealed record PodUsageAggregate(int PeakCpuMillicores, long PeakMemoryBytes, int ObservationCount);
 internal sealed record VmAlertProcessingResult(IReadOnlyList<string> LogLines, bool Changed, bool Skipped);
+internal sealed record ResourceUpdatePlan(
+    string CpuRequest,
+    string MemoryRequest,
+    string? CpuLimit,
+    string? MemoryLimit,
+    bool RequestsChanged,
+    bool LimitsChanged);
 
 internal sealed class VMAlertResourceFixService
 {
@@ -197,8 +204,10 @@ internal sealed class VMAlertResourceFixService
 
             var currentCpu = GetCurrentRequest(vmAlert.Spec.Resources?.Requests, "cpu");
             var currentMemory = GetCurrentRequest(vmAlert.Spec.Resources?.Requests, "memory");
-            var requiresUpdate = !string.Equals(currentCpu, recommendation.CpuRequest, StringComparison.OrdinalIgnoreCase)
-                || !string.Equals(currentMemory, recommendation.MemoryRequest, StringComparison.OrdinalIgnoreCase);
+            var currentCpuLimit = GetCurrentRequest(vmAlert.Spec.Resources?.Limits, "cpu");
+            var currentMemoryLimit = GetCurrentRequest(vmAlert.Spec.Resources?.Limits, "memory");
+            var updatePlan = BuildResourceUpdatePlan(recommendation, currentCpu, currentMemory, currentCpuLimit, currentMemoryLimit);
+            var requiresUpdate = updatePlan.RequestsChanged || updatePlan.LimitsChanged;
 
             logLines.Add(
                 $"{(_options.Apply && requiresUpdate ? "PATCH" : "INFO ")}  {ns}/{name}  " +
@@ -207,7 +216,11 @@ internal sealed class VMAlertResourceFixService
 
             if (_options.Verbose)
             {
-                logLines.Add($"      currentCpu={currentCpu ?? "<unset>"} currentMemory={currentMemory ?? "<unset>"}");
+                logLines.Add($"      currentCpu={currentCpu ?? "<unset>"} currentMemory={currentMemory ?? "<unset>"} currentCpuLimit={currentCpuLimit ?? "<unset>"} currentMemoryLimit={currentMemoryLimit ?? "<unset>"}");
+                if (updatePlan.LimitsChanged)
+                {
+                    logLines.Add($"      adjustedCpuLimit={updatePlan.CpuLimit ?? "<unchanged>"} adjustedMemoryLimit={updatePlan.MemoryLimit ?? "<unchanged>"}");
+                }
             }
 
             if (!requiresUpdate)
@@ -217,7 +230,7 @@ internal sealed class VMAlertResourceFixService
 
             if (_options.Apply)
             {
-                await PatchVmAlertRequestsAsync(ns, name, recommendation, cancellationToken);
+                await PatchVmAlertRequestsAsync(ns, name, updatePlan, cancellationToken);
             }
 
             return new VmAlertProcessingResult(logLines, Changed: true, Skipped: false);
@@ -378,21 +391,44 @@ internal sealed class VMAlertResourceFixService
     private async Task PatchVmAlertRequestsAsync(
         string ns,
         string name,
-        ResourceRecommendation recommendation,
+        ResourceUpdatePlan updatePlan,
         CancellationToken cancellationToken)
     {
+        var requests = new JObject
+        {
+            ["cpu"] = updatePlan.CpuRequest,
+            ["memory"] = updatePlan.MemoryRequest
+        };
+
+        var resources = new JObject
+        {
+            ["requests"] = requests
+        };
+
+        if (updatePlan.LimitsChanged)
+        {
+            var limits = new JObject();
+            if (!string.IsNullOrWhiteSpace(updatePlan.CpuLimit))
+            {
+                limits["cpu"] = updatePlan.CpuLimit;
+            }
+
+            if (!string.IsNullOrWhiteSpace(updatePlan.MemoryLimit))
+            {
+                limits["memory"] = updatePlan.MemoryLimit;
+            }
+
+            if (limits.HasValues)
+            {
+                resources["limits"] = limits;
+            }
+        }
+
         var patchDocument = new JObject
         {
             ["spec"] = new JObject
             {
-                ["resources"] = new JObject
-                {
-                    ["requests"] = new JObject
-                    {
-                        ["cpu"] = recommendation.CpuRequest,
-                        ["memory"] = recommendation.MemoryRequest
-                    }
-                }
+                ["resources"] = resources
             }
         };
 
@@ -417,6 +453,33 @@ internal sealed class VMAlertResourceFixService
             : $"names={string.Join(",", _options.Names.OrderBy(value => value))}";
 
         return $"Scope: {namespaceFilter}; {nameFilter}.";
+    }
+
+    private static ResourceUpdatePlan BuildResourceUpdatePlan(
+        ResourceRecommendation recommendation,
+        string? currentCpuRequest,
+        string? currentMemoryRequest,
+        string? currentCpuLimit,
+        string? currentMemoryLimit)
+    {
+        var requestsChanged = !string.Equals(currentCpuRequest, recommendation.CpuRequest, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(currentMemoryRequest, recommendation.MemoryRequest, StringComparison.OrdinalIgnoreCase);
+
+        var nextCpuLimit = ShouldRaiseCpuLimit(currentCpuLimit, recommendation.CpuRequest)
+            ? recommendation.CpuRequest
+            : null;
+        var nextMemoryLimit = ShouldRaiseMemoryLimit(currentMemoryLimit, recommendation.MemoryRequest)
+            ? recommendation.MemoryRequest
+            : null;
+        var limitsChanged = nextCpuLimit is not null || nextMemoryLimit is not null;
+
+        return new ResourceUpdatePlan(
+            recommendation.CpuRequest,
+            recommendation.MemoryRequest,
+            nextCpuLimit,
+            nextMemoryLimit,
+            requestsChanged,
+            limitsChanged);
     }
 
     private static bool HasVmAlertIdentity(VmAlertModel item)
@@ -474,6 +537,26 @@ internal sealed class VMAlertResourceFixService
         }
 
         return requests.TryGetValue(key, out var value) ? value : null;
+    }
+
+    private static bool ShouldRaiseCpuLimit(string? currentLimit, string request)
+    {
+        if (string.IsNullOrWhiteSpace(currentLimit))
+        {
+            return false;
+        }
+
+        return KubernetesQuantity.ParseCpuToMillicores(currentLimit) < KubernetesQuantity.ParseCpuToMillicores(request);
+    }
+
+    private static bool ShouldRaiseMemoryLimit(string? currentLimit, string request)
+    {
+        if (string.IsNullOrWhiteSpace(currentLimit))
+        {
+            return false;
+        }
+
+        return KubernetesQuantity.ParseMemoryToBytes(currentLimit) < KubernetesQuantity.ParseMemoryToBytes(request);
     }
 
     private static int RoundUp(int value, int step)

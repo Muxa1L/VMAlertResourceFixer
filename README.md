@@ -14,6 +14,7 @@ It reads live pod usage from the Kubernetes local Metrics API served by [metrics
 - applies configurable CPU and memory headroom
 - rounds the result to friendly request values
 - patches `spec.resources.requests.cpu` and `spec.resources.requests.memory`
+- raises `spec.resources.limits.cpu` and `spec.resources.limits.memory` only when an existing limit would otherwise be lower than the new request
 
 By default the tool runs in dry-run mode.
 
@@ -96,7 +97,7 @@ dotnet build .\VMAlertResourceFixer.sln
 
 ## Notes
 
-- The tool only updates resource **requests**.
+- The tool always updates resource **requests** and only raises existing **limits** when they would become invalid by falling below the new requests.
 - It expects the VictoriaMetrics operator deployment naming convention: `vmalert-<name>`.
 - It uses current metrics, sampled over a configurable time window, so results are still only as representative as the sampled workload period.
 - `metrics-server` is intended for autoscaling-style current usage data, not long-term capacity planning.
