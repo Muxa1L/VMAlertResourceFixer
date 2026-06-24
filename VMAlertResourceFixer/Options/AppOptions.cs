@@ -30,6 +30,10 @@ internal sealed record AppOptions
 
     public int MemoryStepMiB { get; private init; } = 16;
 
+    public TimeSpan SamplePeriod { get; private init; } = TimeSpan.FromMinutes(2);
+
+    public TimeSpan SampleInterval { get; private init; } = TimeSpan.FromSeconds(30);
+
     public static AppOptions Parse(string[] args)
     {
         var options = new AppOptions();
@@ -97,9 +101,22 @@ internal sealed record AppOptions
                     options = options with { MemoryStepMiB = ReadPositiveInt(args, ref index, arg) };
                     break;
 
+                case "--sample-period":
+                    options = options with { SamplePeriod = ReadPositiveDuration(args, ref index, arg) };
+                    break;
+
+                case "--sample-interval":
+                    options = options with { SampleInterval = ReadPositiveDuration(args, ref index, arg) };
+                    break;
+
                 default:
                     throw new ArgumentException($"Unknown argument '{arg}'.");
             }
+        }
+
+        if (options.SampleInterval > options.SamplePeriod)
+        {
+            options = options with { SampleInterval = options.SamplePeriod };
         }
 
         return options;
@@ -126,8 +143,12 @@ internal sealed record AppOptions
         Console.WriteLine("  --min-memory-mi <value>  Minimum memory request in MiB. Default: 64");
         Console.WriteLine("  --cpu-step-m <value>     CPU rounding step in millicores. Default: 25");
         Console.WriteLine("  --memory-step-mi <value> Memory rounding step in MiB. Default: 16");
+        Console.WriteLine("  --sample-period <value>  Metrics sampling window. Default: 2m");
+        Console.WriteLine("  --sample-interval <v>    Metrics sampling interval. Default: 30s");
         Console.WriteLine("  --verbose                Print extra diagnostic output.");
         Console.WriteLine("  -h, --help               Show this help.");
+        Console.WriteLine();
+        Console.WriteLine("Duration values accept plain seconds or suffixes like ms, s, m, h.");
     }
 
     private static string ReadNext(string[] args, ref int index, string optionName)
@@ -161,6 +182,59 @@ internal sealed record AppOptions
         }
 
         return value;
+    }
+
+    private static TimeSpan ReadPositiveDuration(string[] args, ref int index, string optionName)
+    {
+        var raw = ReadNext(args, ref index, optionName);
+        if (TryParseDuration(raw, out var value) && value > TimeSpan.Zero)
+        {
+            return value;
+        }
+
+        throw new ArgumentException($"Value for '{optionName}' must be a positive duration like '30s', '2m', or '300'.");
+    }
+
+    private static bool TryParseDuration(string raw, out TimeSpan duration)
+    {
+        if (TimeSpan.TryParse(raw, CultureInfo.InvariantCulture, out duration))
+        {
+            return true;
+        }
+
+        if (raw.EndsWith("ms", StringComparison.OrdinalIgnoreCase))
+        {
+            return TryParseDurationValue(raw[..^2], TimeSpan.FromMilliseconds, out duration);
+        }
+
+        if (raw.EndsWith("s", StringComparison.OrdinalIgnoreCase))
+        {
+            return TryParseDurationValue(raw[..^1], TimeSpan.FromSeconds, out duration);
+        }
+
+        if (raw.EndsWith("m", StringComparison.OrdinalIgnoreCase))
+        {
+            return TryParseDurationValue(raw[..^1], TimeSpan.FromMinutes, out duration);
+        }
+
+        if (raw.EndsWith("h", StringComparison.OrdinalIgnoreCase))
+        {
+            return TryParseDurationValue(raw[..^1], TimeSpan.FromHours, out duration);
+        }
+
+        return TryParseDurationValue(raw, TimeSpan.FromSeconds, out duration);
+    }
+
+    private static bool TryParseDurationValue(string raw, Func<double, TimeSpan> factory, out TimeSpan duration)
+    {
+        if (double.TryParse(raw, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var value) && value > 0)
+        {
+            duration = factory(value);
+            return true;
+        }
+
+        duration = default;
+        return false;
     }
 
     private static void AddCsvValues(ISet<string> set, string raw)

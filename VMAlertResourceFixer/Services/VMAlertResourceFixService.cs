@@ -9,6 +9,8 @@ using VMAlertResourceFixer.Utilities;
 
 namespace VMAlertResourceFixer.Services;
 
+internal sealed record PodUsageAggregate(int PeakCpuMillicores, long PeakMemoryBytes, int ObservationCount);
+
 internal sealed class VMAlertResourceFixService
 {
     private const string VmOperatorGroup = "operator.victoriametrics.com";
@@ -58,7 +60,17 @@ internal sealed class VMAlertResourceFixService
             return 0;
         }
 
-        var metricsCache = new Dictionary<string, Dictionary<string, PodMetricsModel>>(StringComparer.OrdinalIgnoreCase);
+        var namespaces = vmAlerts
+            .Select(item => item.Metadata.NamespaceProperty)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(value => value)
+            .ToList();
+
+        Console.WriteLine(
+            $"Collecting pod metrics samples for {FormatDuration(_options.SamplePeriod)} every {FormatDuration(_options.SampleInterval)} across {namespaces.Count} namespace(s).");
+
+        var metricsCache = await CollectMaxPodMetricsByNamespaceAsync(namespaces, cancellationToken);
         var changed = 0;
         var skipped = 0;
 
@@ -72,11 +84,8 @@ internal sealed class VMAlertResourceFixService
                 var deploymentName = $"vmalert-{name}";
                 var deployment = await _kubernetes.AppsV1.ReadNamespacedDeploymentAsync(deploymentName, ns, cancellationToken: cancellationToken);
 
-                if (!metricsCache.TryGetValue(ns, out var namespaceMetrics))
-                {
-                    namespaceMetrics = await GetPodMetricsByNameAsync(ns, cancellationToken);
-                    metricsCache[ns] = namespaceMetrics;
-                }
+                metricsCache.TryGetValue(ns, out var namespaceMetrics);
+                namespaceMetrics ??= new Dictionary<string, PodUsageAggregate>(StringComparer.OrdinalIgnoreCase);
 
                 var pods = await GetDeploymentPodsAsync(ns, deployment, cancellationToken);
                 var recommendation = BuildRecommendation(pods, namespaceMetrics);
@@ -142,6 +151,47 @@ internal sealed class VMAlertResourceFixService
         }
 
         return items;
+    }
+
+    private async Task<Dictionary<string, Dictionary<string, PodUsageAggregate>>> CollectMaxPodMetricsByNamespaceAsync(
+        IReadOnlyCollection<string> namespaces,
+        CancellationToken cancellationToken)
+    {
+        var collected = namespaces.ToDictionary(
+            ns => ns,
+            _ => new Dictionary<string, PodUsageAggregate>(StringComparer.OrdinalIgnoreCase),
+            StringComparer.OrdinalIgnoreCase);
+        var snapshotCount = CalculateSnapshotCount(_options.SamplePeriod, _options.SampleInterval);
+
+        for (var sampleIndex = 0; sampleIndex < snapshotCount; sampleIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            foreach (var ns in namespaces)
+            {
+                var snapshot = await GetPodMetricsByNameAsync(ns, cancellationToken);
+                MergePodMetricSnapshot(collected[ns], snapshot);
+            }
+
+            if (sampleIndex == snapshotCount - 1)
+            {
+                break;
+            }
+
+            if (_options.Verbose)
+            {
+                Console.WriteLine($"Collected metrics snapshot {sampleIndex + 1} of {snapshotCount}; waiting {FormatDuration(_options.SampleInterval)} for the next sample.");
+            }
+
+            await Task.Delay(_options.SampleInterval, cancellationToken);
+        }
+
+        if (_options.Verbose)
+        {
+            Console.WriteLine($"Collected {snapshotCount} metrics snapshot(s) across {namespaces.Count} namespace(s).");
+        }
+
+        return collected;
     }
 
     private async Task<Dictionary<string, PodMetricsModel>> GetPodMetricsByNameAsync(string ns, CancellationToken cancellationToken)
@@ -249,9 +299,9 @@ internal sealed class VMAlertResourceFixService
 
     private ResourceRecommendation? BuildRecommendation(
         IReadOnlyList<V1Pod> pods,
-        IReadOnlyDictionary<string, PodMetricsModel> namespaceMetrics)
+        IReadOnlyDictionary<string, PodUsageAggregate> namespaceMetrics)
     {
-        var samples = new List<(int CpuMillicores, long MemoryBytes)>();
+        var samples = new List<(int CpuMillicores, long MemoryBytes, int ObservationCount)>();
 
         foreach (var pod in pods)
         {
@@ -260,25 +310,9 @@ internal sealed class VMAlertResourceFixService
                 continue;
             }
 
-            var cpuMillicores = 0;
-            long memoryBytes = 0;
-
-            foreach (var container in metrics.Containers)
+            if (metrics.PeakCpuMillicores > 0 || metrics.PeakMemoryBytes > 0)
             {
-                if (container.Usage.TryGetValue("cpu", out var cpuRaw))
-                {
-                    cpuMillicores += KubernetesQuantity.ParseCpuToMillicores(cpuRaw);
-                }
-
-                if (container.Usage.TryGetValue("memory", out var memoryRaw))
-                {
-                    memoryBytes += KubernetesQuantity.ParseMemoryToBytes(memoryRaw);
-                }
-            }
-
-            if (cpuMillicores > 0 || memoryBytes > 0)
-            {
-                samples.Add((cpuMillicores, memoryBytes));
+                samples.Add((metrics.PeakCpuMillicores, metrics.PeakMemoryBytes, metrics.ObservationCount));
             }
         }
 
@@ -303,7 +337,7 @@ internal sealed class VMAlertResourceFixService
             peakMemoryBytes,
             recommendedCpuMillicores,
             recommendedMemoryMiB,
-            samples.Count);
+                samples.Sum(item => item.ObservationCount));
     }
 
     private async Task PatchVmAlertRequestsAsync(
@@ -361,6 +395,42 @@ internal sealed class VMAlertResourceFixService
         return string.Equals(pod.Status?.Phase, "Running", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static void MergePodMetricSnapshot(
+        IDictionary<string, PodUsageAggregate> aggregateByPod,
+        IReadOnlyDictionary<string, PodMetricsModel> snapshot)
+    {
+        foreach (var (podName, metrics) in snapshot)
+        {
+            var cpuMillicores = 0;
+            long memoryBytes = 0;
+
+            foreach (var container in metrics.Containers)
+            {
+                if (container.Usage.TryGetValue("cpu", out var cpuRaw))
+                {
+                    cpuMillicores += KubernetesQuantity.ParseCpuToMillicores(cpuRaw);
+                }
+
+                if (container.Usage.TryGetValue("memory", out var memoryRaw))
+                {
+                    memoryBytes += KubernetesQuantity.ParseMemoryToBytes(memoryRaw);
+                }
+            }
+
+            if (aggregateByPod.TryGetValue(podName, out var existing))
+            {
+                aggregateByPod[podName] = new PodUsageAggregate(
+                    Math.Max(existing.PeakCpuMillicores, cpuMillicores),
+                    Math.Max(existing.PeakMemoryBytes, memoryBytes),
+                    existing.ObservationCount + 1);
+            }
+            else
+            {
+                aggregateByPod[podName] = new PodUsageAggregate(cpuMillicores, memoryBytes, 1);
+            }
+        }
+    }
+
     private static string? GetCurrentRequest(IReadOnlyDictionary<string, string>? requests, string key)
     {
         if (requests is null)
@@ -390,6 +460,26 @@ internal sealed class VMAlertResourceFixService
     private static string FormatBytesAsMi(long bytes)
     {
         return $"{BytesToMiB(bytes).ToString("0.##", CultureInfo.InvariantCulture)}Mi";
+    }
+
+    private static string FormatDuration(TimeSpan value)
+    {
+        if (value.TotalHours >= 1)
+        {
+            return value.ToString("hh\\:mm\\:ss", CultureInfo.InvariantCulture);
+        }
+
+        return value.ToString("mm\\:ss", CultureInfo.InvariantCulture);
+    }
+
+    private static int CalculateSnapshotCount(TimeSpan period, TimeSpan interval)
+    {
+        if (interval <= TimeSpan.Zero)
+        {
+            return 1;
+        }
+
+        return Math.Max(1, (int)Math.Floor(period.Ticks / (double)interval.Ticks) + 1);
     }
 
     private static string BuildLabelSelector(V1LabelSelector? selector)

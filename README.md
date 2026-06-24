@@ -9,7 +9,8 @@ It reads live pod usage from the Kubernetes local Metrics API served by [metrics
 - discovers `VMAlert` resources
 - resolves the operator-created `Deployment` named `vmalert-<name>`
 - reads the current usage of its running pods from `metrics.k8s.io/v1beta1`
-- takes the highest current pod usage per `VMAlert`
+- samples pod usage repeatedly over a configurable period
+- takes the highest observed pod usage per `VMAlert` across those samples
 - applies configurable CPU and memory headroom
 - rounds the result to friendly request values
 - patches `spec.resources.requests.cpu` and `spec.resources.requests.memory`
@@ -24,6 +25,8 @@ By default the tool runs in dry-run mode.
 - Minimum memory request: `64Mi`
 - CPU rounding step: `25m`
 - Memory rounding step: `16Mi`
+- Sampling period: `2m`
+- Sampling interval: `30s`
 
 ## Usage
 
@@ -49,6 +52,12 @@ Use a custom kubeconfig and more aggressive headroom:
 
 ```powershell
 dotnet run --project .\VMAlertResourceFixer\VMAlertResourceFixer.csproj -- --apply --kubeconfig C:\Users\me\.kube\config --context dev --cpu-headroom 1.5 --memory-headroom 1.4
+```
+
+Collect multiple samples over five minutes and use the max observed values:
+
+```powershell
+dotnet run --project .\VMAlertResourceFixer\VMAlertResourceFixer.csproj -- --sample-period 5m --sample-interval 30s
 ```
 
 ## Required cluster permissions
@@ -82,5 +91,5 @@ dotnet build .\VMAlertResourceFixer.sln
 
 - The tool only updates resource **requests**.
 - It expects the VictoriaMetrics operator deployment naming convention: `vmalert-<name>`.
-- It uses current metrics, so results are only as stable as the current workload snapshot.
+- It uses current metrics, sampled over a configurable time window, so results are still only as representative as the sampled workload period.
 - `metrics-server` is intended for autoscaling-style current usage data, not long-term capacity planning.
